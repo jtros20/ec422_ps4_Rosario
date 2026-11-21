@@ -101,4 +101,17 @@ forecast::dm.test(
 )
 # The ARIMA vs. ETS test produced a DM statistic of -2.9062 (p = 0.004042), while ARIMA vs. SNAIVE produced -10.755 (p < 2.2e-16). Both results are statistically significant, so I would choose ARIMA for its better forecast accuracy.
 
+# Equal Weighted ARIMA and ETS
+liquor_combo_fc <- liquor_cv_fit |>
+  mutate(combo = (arima + ets) / 2) |>
+  forecast(h = 1)
+
+liquor_combo_fc |>
+  accuracy(liquor, measures = list(RMSE = RMSE, MAE = MAE))
+
+#The combo model performs better than ETS, with a lower RMSE (85.2 vs. 94.4) and MAE (66.8 vs. 72.3). However, ARIMA still performs slightly better than the combo model on both metrics.
+
+cor(liquor_errs$arima, liquor_errs$ets)
+#A combination of these forecasts do not perform better. This is likely due to strong correlation between the forecast errors from ARIMA and ETS models (correlation = 0.8783). Further, as ARIMA had significantly better predictions than ETS (p-value = 0.0040), a combination of the two models has resulted in very slightly worse forecasts.
+
 
