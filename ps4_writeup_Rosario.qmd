@@ -1,0 +1,307 @@
+---
+title: "Problem Set 4"
+author: "Jacob Rosario"
+date: today
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+**GitHub repo:** <https://github.com/jtros20/ec422_ps4_Rosario>
+
+## ARIMA vs. ETS
+
+### 2.1 Liquor store sales and seasonality
+
+```{r}
+library(tidyverse)
+library(fpp3)
+library(BVAR)
+
+liquor_raw <- read_csv(
+  "data/MRTSSM4453USN.csv",
+  na = ".",
+  col_types = cols(
+    observation_date = col_date(format = "%Y-%m-%d"),
+    MRTSSM4453USN = col_double()
+  )
+)
+
+liquor <- liquor_raw |>
+  transmute(Month = yearmonth(observation_date), sales = MRTSSM4453USN) |>
+  as_tsibble(index = Month) |>
+  filter(Month <= yearmonth("2019 Dec"))
+
+has_gaps(liquor)
+
+liquor |>
+  autoplot(sales) +
+  labs(title = "Monthly U.S. Liquor Store Sales", x = "Year",
+       y = "Sales (Millions of Dollars)") +
+  theme_minimal()
+
+liquor |>
+  gg_season(log(sales)) +
+  labs(title = "Seasonal Pattern in U.S. Liquor Store Sales",
+       x = "Month", y = "Log of Sales") +
+  theme_minimal()
+```
+
+Sales in U.S. liquor stores increase overall, with sales peaking in December and reaching their lowest levels in January and February. Seasonal fluctuations grow as sales increase, so taking logarithms helps stabilize them.
+
+### 2.2 Model specifications and residual diagnostics
+
+```{r}
+liquor_fit <- liquor |>
+  model(arima = ARIMA(log(sales)),
+        ets   = ETS(log(sales)))
+
+liquor_fit |> select(arima) |> report()
+liquor_fit |> select(ets) |> report()
+```
+
+The selected ARIMA model is ARIMA(1,0,2)(2,1,1)[12] with drift: it uses one seasonal difference at a 12-month lag and no regular differencing. The selected ETS model is ETS(A,A,A), with additive errors, an additive trend, and additive seasonality.
+
+```{r}
+liquor_fit |> select(arima) |> gg_tsresiduals()
+
+liquor_fit |>
+  select(arima) |>
+  augment() |>
+  features(.innov, ljung_box, lag = 24, dof = 6)
+```
+
+The Ljung–Box test checks whether the ARIMA residuals retain autocorrelation at lag 24; a p-value below 0.05 indicates evidence against white-noise residuals. This diagnostic alone does not establish which model forecasts best.
+
+### 2.3 Expanding-window forecast horse race
+
+The first training window contains 120 months, giving 228 one-step-ahead forecast origins. The first forecast is for January 2001 and the last is for December 2019. The cross-validated model fits are loaded from the saved results rather than re-estimated.
+
+```{r}
+liquor_cv_fit <- readRDS("results/liquor_cv_fit.rds")
+liquor_cv_fc <- liquor_cv_fit |> forecast(h = 1)
+
+liquor_cv_fc |>
+  accuracy(liquor, measures = list(RMSE = RMSE, MAE = MAE)) |>
+  knitr::kable(digits = 2)
+```
+
+ARIMA has the lowest RMSE (81.43) and MAE (65.65), followed by ETS and SNAIVE. Both accuracy measures agree that ARIMA forecasts most accurately.
+
+### 2.4 Diebold–Mariano tests
+
+```{r}
+liquor_errs <- liquor_cv_fc |>
+  as_tibble() |>
+  left_join(as_tibble(liquor) |> select(Month, actual = sales),
+            by = "Month") |>
+  mutate(e = actual - .mean) |>
+  select(Month, .model, e) |>
+  pivot_wider(names_from = .model, values_from = e)
+
+forecast::dm.test(liquor_errs$arima, liquor_errs$ets, h = 1, power = 2)
+forecast::dm.test(liquor_errs$arima, liquor_errs$snaive, h = 1, power = 2)
+```
+
+The ARIMA-versus-ETS test gives DM = -2.9062 (p = 0.004042), while ARIMA versus SNAIVE gives DM = -10.755 (p < 2.2e-16). Both differences are statistically significant, so I would choose ARIMA for the liquor store chain.
+
+## Forecast Combination
+
+### 3.1 Equal-weight combination
+
+```{r}
+liquor_combo_fc <- liquor_cv_fit |>
+  mutate(combo = (arima + ets) / 2) |>
+  forecast(h = 1)
+
+liquor_combo_fc |>
+  accuracy(liquor, measures = list(RMSE = RMSE, MAE = MAE)) |>
+  knitr::kable(digits = 2)
+```
+
+The equal-weight combination improves on ETS, with RMSE of 85.2 versus 94.4 and MAE of 66.8 versus 72.3. However, ARIMA still performs slightly better than the combination on both measures.
+
+### 3.2 Correlation of forecast errors
+
+```{r}
+cor(liquor_errs$arima, liquor_errs$ets)
+```
+
+The combination did not beat ARIMA because the two models' forecast errors are strongly correlated (0.8783), leaving little benefit from diversification. The earlier DM test also showed that ARIMA significantly outperformed ETS (p = 0.0040), so equal weighting slightly reduced accuracy.
+
+## VAR vs. BVAR
+
+### 4.1 Quarterly data and transformations
+
+```{r}
+qd_raw <- read_csv("data/fredqd_2026-09.csv", show_col_types = FALSE) |>
+  slice(-(1:2))
+
+growth <- function(x) 100 * difference(log(x))
+
+qd <- qd_raw |>
+  mutate(date = as.Date(sasdate, "%m/%d/%Y")) |>
+  transmute(date,
+            gdp    = growth(GDPC1),
+            cons   = growth(PCECC96),
+            inv    = growth(GPDIC1),
+            emp    = growth(PAYEMS),
+            infl   = growth(GDPCTPI),
+            unrate = difference(UNRATE),
+            ffr    = difference(FEDFUNDS),
+            gs10   = difference(GS10)) |>
+  filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+
+y <- qd |> select(-date) |> as.matrix()
+c(observations = nrow(y), variables = ncol(y))
+```
+
+### 4.2 VAR(1) versus VAR(4)
+
+The expanding-window exercise starts with 120 quarters. VAR(1) forecasts better for seven of the eight variables; VAR(4) is slightly better only for inflation. Even though VAR(4) nests VAR(1), estimating more parameters can increase overfitting and forecast error.
+
+### 4.3 Bayesian shrinkage and forecast accuracy
+
+The saved table below contains the original expanding-window RMSE results for VAR(1), VAR(4), and both BVAR(4) prior settings. Loading it avoids rerunning the computationally intensive BVAR estimation.
+
+```{r}
+var_results <- readRDS("results/var_results.rds")
+var_results |> knitr::kable(digits = 3)
+```
+
+**1.** BVAR(4) with lambda = 0.3 outperforms VAR(4) for all eight variables because Bayesian shrinkage reduces overfitting and estimation error.
+
+**2.** VAR(1) performs better for five variables, while BVAR(4) with lambda = 0.3 performs better for investment, inflation, and the 10-year Treasury yield.
+
+**3.** When lambda = 0.05, stronger shrinkage generally worsens accuracy, suggesting that excessive shrinkage removes useful information. The winning model's RMSE may be overly optimistic because selecting and evaluating models using the same results creates selection bias.
+
+### 4.3c Diebold–Mariano comparisons
+
+The DM statistics below are the results from the original script, reported directly to avoid repeating the VAR/BVAR horse race.
+
+```{r}
+tibble(
+  Variable = c("GDP growth", "Inflation"),
+  `DM statistic` = c(2.1366, 1.4529),
+  `p-value` = c(0.03468, 0.1489)
+) |>
+  knitr::kable(digits = 5)
+```
+
+For GDP growth, the DM statistic is 2.1366 (p = 0.03468), indicating that BVAR(4) is significantly more accurate than VAR(4). For inflation, the statistic is 1.4529 (p = 0.1489), so the difference is not statistically significant; lower RMSE does not always imply a statistically significant improvement.
+
+## Factor Model
+
+### 5.1 FRED-MD transformations
+
+```{r}
+md_raw <- read_csv("data/fredmd_2026-09.csv", show_col_types = FALSE)
+tcode <- unlist(md_raw[1, -1])
+md <- md_raw[-1, ] |> mutate(date = as.Date(sasdate, "%m/%d/%Y"))
+
+transform_series <- function(x, code) {
+  d <- function(v) c(NA, diff(v))
+  switch(as.character(code),
+         "1" = x,
+         "2" = d(x),
+         "3" = d(d(x)),
+         "4" = log(x),
+         "5" = 100 * d(log(x)),
+         "6" = 100 * d(d(log(x))),
+         "7" = d(x / dplyr::lag(x) - 1))
+}
+
+fm <- map2_dfc(md[names(tcode)], tcode, transform_series) |>
+  mutate(date = md$date, .before = 1) |>
+  filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+
+fm <- fm[, colSums(is.na(fm)) == 0]
+
+tcode[c("INDPRO", "PAYEMS", "CPIAUCSL", "FEDFUNDS")]
+```
+
+**INDPRO (5):** The first difference of the log measures monthly growth in industrial production. **PAYEMS (5):** The first difference of the log measures monthly employment growth. **CPIAUCSL (6):** The second difference of the log measures changes in inflation. **FEDFUNDS (2):** The first difference measures monthly changes in the interest rate. FEDFUNDS differs from INDPRO because interest rates are already percentages, whereas percentage changes are more useful for an industrial production index.
+
+### 5.2 Principal components
+
+```{r}
+Z <- fm |> select(-date) |> as.matrix()
+pc <- prcomp(scale(Z))
+summary(pc)$importance[, 1:5] |> knitr::kable(digits = 4)
+
+F1 <- pc$x[, 1] * sign(cor(pc$x[, 1], fm$INDPRO))
+
+tibble(date = fm$date, F1 = F1) |>
+  ggplot(aes(date, F1)) +
+  geom_line() +
+  labs(title = "First Factor from FRED-MD", x = NULL, y = NULL) +
+  theme_minimal()
+
+sort(abs(cor(pc$x[, 1], Z))[1, ], decreasing = TRUE)[1:8]
+sort(abs(cor(pc$x[, 2], Z))[1, ], decreasing = TRUE)[1:8]
+```
+
+The first three factors explain 29.45% of the variation across all 121 series. The first factor captures overall economic activity, particularly employment and industrial production, with sharp declines during recessions; the second captures inflation and price movements, reflecting its strong correlations with consumer price and expenditure price measures.
+
+### 5.3 Factor-augmented forecasting
+
+```{r}
+ip <- fm$INDPRO
+n <- nrow(Z)
+init <- which(fm$date == as.Date("1989-12-01"))
+
+e_ar <- NULL
+e_fa <- NULL
+for (T in init:(n - 1)) {
+  F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:3]
+  d <- data.frame(y_next = ip[2:T], y = ip[1:(T - 1)], F_T[1:(T - 1), ])
+  new <- data.frame(y = ip[T], t(F_T[T, ]))
+  e_ar <- c(e_ar, ip[T + 1] - predict(lm(y_next ~ y, d), new))
+  e_fa <- c(e_fa, ip[T + 1] - predict(lm(y_next ~ ., d), new))
+}
+
+c(RMSE_AR = sqrt(mean(e_ar^2)), RMSE_FA = sqrt(mean(e_fa^2)))
+```
+
+The RMSE results match the class example: 0.617 for AR(1) and 0.589 for the factor model. Estimating factors using the entire sample before forecasting would introduce look-ahead bias because future information would enter earlier forecasts.
+
+### 5.4 Direct 12-month CPI inflation forecasts
+
+```{r}
+direct_race <- function(series, h = 12, r = 3) {
+  lv <- md |>
+    mutate(log_x = log(.data[[series]]),
+           g = 100 * (log_x - lag(log_x))) |>
+    filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+  yh <- 100 * (lead(lv$log_x, h) - lv$log_x)
+  g <- lv$g
+
+  e_ar <- NULL
+  e_fa <- NULL
+  for (T in init:(n - h)) {
+    F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:r, drop = FALSE]
+    i <- 1:(T - h)
+    d <- data.frame(yh = yh[i], g = g[i], F_T[i, , drop = FALSE])
+    new <- data.frame(g = g[T], F_T[T, , drop = FALSE])
+    e_ar <- c(e_ar, yh[T] - predict(lm(yh ~ g, d), new))
+    e_fa <- c(e_fa, yh[T] - predict(lm(yh ~ ., d), new))
+  }
+  tibble(series, forecasts = length(e_ar),
+         RMSE_AR = sqrt(mean(e_ar^2)), RMSE_FA = sqrt(mean(e_fa^2)),
+         MAE_AR = mean(abs(e_ar)), MAE_FA = mean(abs(e_fa)),
+         DM_pvalue = forecast::dm.test(e_ar, e_fa, h = h, power = 2,
+                                       varestimator = "bartlett")$p.value)
+}
+
+direct_race("CPIAUCSL") |> knitr::kable(digits = 4)
+```
+
+The factors improve 12-month CPI inflation forecasts, reducing RMSE from 2.11 to 1.89, a 10.43% reduction. The improvement is statistically significant (DM test p = 0.000443).
+
+## Reflection
+
+It was apparent that more complex models do not necessarily provide improved forecasts. In many cases the reduced VAR(1) model performed better than the VAR(4). The ARIMA model also outperformed both individually ETS and combined equally ETS and ARIMA. Although combining models (via shrinkage, equal weighting and factor models) can improve forecasts by reducing the impact of error, this is only useful if additional information is beneficial. Since ARIMA errors were highly correlated with ETS errors, and the performances were worse at very high levels of shrinkage, this shows that adding extra information is only helpful when it is useful. Out of sample results and statistically significant differences are important to consider. A lower RMSE in the data does not necessarily mean that the model will perform better in future forecasts.
